@@ -1,0 +1,274 @@
+---
+title: "final predictive"
+author: "Nana"
+date: "2025-02-06"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+library(tidyverse)
+library(skimr)
+library(caret)
+library(randomForest)
+library(ROCR)
+library(xgboost)
+library(SHAPforxgboost)
+
+Haven_data <- read.csv(file.choose())
+head(Haven_data)
+skim(Haven_data)
+
+
+#CHECKING FOR NULL VALUES
+anyNA(Haven_data)
+colSums(is.na(Haven_data))
+
+#INCOME
+#There were 15 missing values in the dataset for the Income column.The team decided to replace the missing values with the median 
+median_income <- median(Haven_data$Income,na.rm = T)
+Haven_data$Income[is.na(Haven_data$Income)] <- median_income
+#Haven_data <- drop_na(Haven_data)
+anyNA(Haven_data)
+
+
+
+#CHECKING FOR DUPLICATES
+sum(duplicated(Haven_data))
+#111 duplicates were found in the data. The team decided to drop duplicate rows to ensure the data had unique rows
+Haven_data <- Haven_data[!duplicated(Haven_data),]
+sum(duplicated(Haven_data))
+
+#checking for the data types
+sapply(Haven_data,class)
+
+Haven_data<- Haven_data %>%
+  mutate(Marital_Status = case_when(
+    Marital_Status == "Single" ~ "single",
+    Marital_Status == "Married" ~ "married",
+    Marital_Status == "Divorced" ~ "single",
+    Marital_Status == "Alone" ~ "single",
+    Marital_Status == "Widow" ~ "single",
+    Marital_Status == "YOLO" ~ "single",
+    Marital_Status == "Together" ~ "married",
+    Marital_Status == "Absurd" ~ "married"
+    
+  ))
+#anyNA(Haven_data)
+
+#Converting the categorical variables to factors 
+Haven_data <- Haven_data %>% mutate_at(c("Education","Response","Marital_Status","AcceptedCmp1",
+                                         "AcceptedCmp2","AcceptedCmp3","AcceptedCmp4","AcceptedCmp5","Complain"),factor)
+sapply(Haven_data, class)
+
+#checking outliers in numerical variables
+boxplot(Haven_data[,4:6])
+boxplot(Haven_data$Recency)
+boxplot(Haven_data[,9:14])
+boxplot(Haven_data[,15:19])
+
+
+table(Haven_data$Education)
+table(Haven_data$Response)
+#relationships among variables
+ggplot(Haven_data,aes(x=Response))+geom_bar(fill="skyblue")+labs(title = "Frequency of the response variable")
+ggplot(Haven_data,aes(x=Response,y=NumStorePurchases))+geom_boxplot()+labs(title = "Relationship between NumStorepurchases and the response variable",x="Response",y="NumStorepurchases")
+ggplot(Haven_data,aes(x=Response,y=NumWebPurchases))+geom_boxplot()+labs(title = "Relationship between Numwebpurchases and the response variable",x="Response",y="Numwebpurchases")
+ggplot(Haven_data,aes(x=Response,y=Recency))+geom_boxplot()+labs(title = "Relationship between Recency and the response variable",x="Response",y="Recency")
+#ggplot(Haven_data,aes(y=Dt_Cus_Year,x=Recency))+geom_point()+labs(title = "Relationship between Recency and the response variable",x="Response",y="Recency")
+
+#Converting Dt_Customer column to date format
+#Haven_data %>% select(Dt_Customer)
+Haven_data$Dt_Customer <- mdy(Haven_data$Dt_Customer)
+sapply(Haven_data,class)
+#EXTRACTING DAY,MONTH,YEAR COLUMNS FROM DT_CUSTOMER COLUMN
+Haven_data$Dt_Cus_Year <- as.numeric(format(Haven_data$Dt_Customer, "%Y"))
+Haven_data$Dt_Cus_Month <- as.factor(format(Haven_data$Dt_Customer, "%m"))
+#Haven_data$Dt_Cus_Day <- as.factor(format(Haven_data$Dt_Customer, "%d"))
+#DROPPING DT_CUSTOMER COLUMN
+Haven_data <- Haven_data[, !(names(Haven_data) %in% "Dt_Customer")]
+
+
+#Factor recoding of response variable
+Haven_data$Response<-fct_recode(Haven_data$Response, Yes = "1",No = "0")
+
+#relevel response
+Haven_data$Response<- relevel(Haven_data$Response, ref = "Yes")
+levels(Haven_data$Response)
+#CREATING DUMMY VARIABLES
+Haven_data_dummy <- model.matrix(Response~ ., data=Haven_data)
+Haven_data_dummy<- data.frame(Haven_data_dummy[,-1]) #get rid of intercept
+dim(Haven_data_dummy)
+#nrow(Haven_data_dummy)
+dim(Haven_data)
+
+Haven_data <- cbind(Response=Haven_data$Response, Haven_data_dummy)
+#write.csv(Haven_data,"Cleaned_Haven_dataset.csv",row.names = FALSE)
+#DATA PARTITIONING
+set.seed(234) #set random seed
+
+index <- createDataPartition(Haven_data$Response, p = .8,list = FALSE)
+
+assign_train <- Haven_data[index,]
+
+assign_test <- Haven_data[-index,]
+
+#RANDOM FOREST MODEL
+set.seed(234)
+
+rf_model <- train(Response ~ .,
+                      data = assign_train,
+                      tuneGrid= expand.grid(mtry = c(1, 3,6,9)),
+                      trControl =trainControl(method = "cv",number = 5,
+                                              classProbs = TRUE,
+                                              summaryFunction = twoClassSummary),
+                      metric="ROC")
+
+rf_model
+plot(rf_model)
+rf_model$bestTune
+#important predictor variables
+var_importance <- varImp(rf_model)
+print(var_importance)
+plot(varImp(rf_model))
+
+# get the predicted probabilities of the test data.
+
+RF_predprob <-predict(rf_model , assign_test, type="prob")
+
+# Evaluate Model Performance
+
+RF_pred <- prediction(RF_predprob$Yes, assign_test$Response,label.ordering =c("No","Yes"))
+RF_perf <- performance(RF_pred, "tpr", "fpr")
+plot(RF_perf, colorize=TRUE)
+
+RF_auc<-unlist(slot(performance(RF_pred, "auc"), "y.values"))
+
+RF_auc
+
+#GRADIENT BOOSTING MODEL
+set.seed(234)
+model_gbm <- train(Response ~ .,
+                   data = assign_train,
+                   method = "xgbTree",
+                   trControl =trainControl(method = "cv", 
+                                           number = 5),
+                   tuneGrid = expand.grid(
+                     nrounds = c(50,100,200),
+                     eta = c(0.025,0.035, 0.05),
+                     max_depth = c(2, 3,5),
+                     gamma = 0,
+                     colsample_bytree = 1,
+                     min_child_weight = 1,
+                     subsample = 1),
+                   verbose=FALSE)
+plot(model_gbm)
+model_gbm$bestTune
+plot(varImp(model_gbm))
+
+
+Xdata<-as.matrix(select(assign_train,-Response)) # change data to matrix for plots
+# Crunch SHAP values
+#head(assign_train)
+#sapply(Xdata, class)
+shap <- shap.prep(model_gbm$finalModel, X_train = Xdata)
+
+# SHAP importance plot
+shap.plot.summary(shap)
+
+# Use 4 most important predictor variables
+top4<-shap.importance(shap, names_only = TRUE)[1:4]
+top4
+for (x in top4) {
+  p <- shap.plot.dependence(
+    shap, 
+    x = x, 
+    color_feature = "auto", 
+    smooth = FALSE, 
+    jitter_width = 0.01, 
+    alpha = 1
+  ) +
+    ggtitle(x)
+  print(p)
+}
+#cor_matrix <- cor(assign_train[, c("Recency", "NumWebVisitsMonth")])
+#print(cor_matrix)
+#checking predictions
+XGB_predprob <-predict(model_gbm , assign_test, type="prob")
+
+
+
+XGB_pred <- prediction(XGB_predprob$Yes, assign_test$Response,label.ordering =c("No","Yes"))
+XGB_perf <- performance(XGB_pred, "tpr", "fpr")
+plot(XGB_perf, colorize=TRUE)
+
+XGB_auc<-unlist(slot(performance(XGB_pred, "auc"), "y.values"))
+
+XGB_auc
+
+
+#FORWARD SELECTION
+set.seed(234)
+Forward_selection_model <- train(Response~.,data = assign_train,method="glmStepAIC",
+                                 direction="forward",trControl=trainControl(method="cv",number = 5,classProbs = TRUE,summaryFunction = twoClassSummary),
+                                 metric="ROC")
+coef(Forward_selection_model$finalModel)
+
+predprob_FS<-predict(Forward_selection_model , assign_test, type="prob")
+
+pred_FS <- prediction(predprob_FS$Yes, assign_test$Response,label.ordering =c("No","Yes"))
+perf_FS <- performance(pred_FS, "tpr", "fpr")
+plot(perf_FS, colorize=TRUE)
+auc_FS<-unlist(slot(performance(pred_FS, "auc"), "y.values"))
+auc_FS
+
+
+
+
+#Backward selection
+Backward_selection_model <- train(Response~.,data = assign_train,method="glmStepAIC",
+                                  direction="backward",trControl=trainControl(method="cv",number = 5,classProbs = TRUE,summaryFunction = twoClassSummary),
+                                  metric="ROC")
+coef(Backward_selection_model$finalModel)
+
+
+predprob_BS<-predict(Backward_selection_model , assign_test, type="prob")
+
+pred_BS <- prediction(predprob_BS$Yes, assign_test$Response,label.ordering =c("No","Yes"))
+perf_BS <- performance(pred_BS, "tpr", "fpr")
+plot(perf_BS, colorize=TRUE)
+auc_BS<-unlist(slot(performance(pred_BS, "auc"), "y.values"))
+auc_BS
+
+
+
+#LASSO
+lasso_model <- train(Response ~ .,
+                     data = assign_train,
+                     method = "glmnet",
+                     standardize =T,
+                     tuneGrid = expand.grid(alpha =1, 
+                                            lambda = seq(0.0001, 1, length = 20)),
+                     trControl =trainControl(method = "cv",
+                                             number = 5,
+                                             classProbs = TRUE,
+                                             summaryFunction = twoClassSummary),
+                     metric="ROC")
+
+lasso_model
+
+coef(lasso_model$finalModel, lasso_model$bestTune$lambda)
+
+predprob_lasso<-predict(lasso_model , assign_test, type="prob")
+#head(predprob_lasso)
+
+
+pred_lasso <- prediction(predprob_lasso$Yes, assign_test$Response,label.ordering =c("No","Yes"))
+perf_lasso <- performance(pred_lasso, "tpr", "fpr")
+plot(perf_lasso, colorize=TRUE)
+auc_lasso<-unlist(slot(performance(pred_lasso, "auc"), "y.values"))
+auc_lasso
+#auc_BS
+auc_FS
+
+```
+
